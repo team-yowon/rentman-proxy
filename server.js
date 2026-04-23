@@ -1,7 +1,7 @@
 const http = require('http');
 const https = require('https');
 
-const PORT = 3131;
+const PORT = process.env.PORT || 3131;
 const RENTMAN_BASE = 'api.rentman.net';
 
 const server = http.createServer((req, res) => {
