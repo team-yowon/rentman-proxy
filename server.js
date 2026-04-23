@@ -4,7 +4,7 @@ const https = require('https');
 const PORT = process.env.PORT || 3131;
 const RENTMAN_BASE = 'api.rentman.net';
 
-const server = http.createServer((req, res) => {
+const server.listen(PORT, '0.0.0.0', () => {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
