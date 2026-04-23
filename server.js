@@ -35,166 +35,14 @@ function rentmanRequest(path, method = 'GET', body = null) {
 }
 
 // MCP Tools definition
-const TOOLS = [
-  {
-    name: 'get_projects',
-    description: 'Obtener lista de proyectos de Rentman. Puede filtrar por estado, fecha o nombre.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'number', description: 'Cantidad máxima de resultados (default 50)' },
-        status: { type: 'string', description: 'Filtrar por estado del proyecto' },
-      },
-    },
-  },
-  {
-    name: 'get_project',
-    description: 'Obtener detalle completo de un proyecto específico por ID.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        id: { type: 'number', description: 'ID del proyecto' },
-      },
-      required: ['id'],
-    },
-  },
-  {
-    name: 'get_invoices',
-    description: 'Obtener facturas. Permite filtrar por estado, fecha, cliente. Útil para informes de ventas y contabilidad.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'number', description: 'Cantidad máxima de resultados (default 50)' },
-        status: { type: 'string', description: 'Filtrar por estado: open, paid, cancelled' },
-      },
-    },
-  },
-  {
-    name: 'get_invoice_lines',
-    description: 'Obtener líneas de factura detalladas para análisis de ventas por producto/servicio.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'number', description: 'Cantidad máxima de resultados (default 50)' },
-      },
-    },
-  },
-  {
-    name: 'get_equipment',
-    description: 'Obtener inventario de equipos y materiales disponibles en Rentman.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'number', description: 'Cantidad máxima de resultados (default 50)' },
-      },
-    },
-  },
-  {
-    name: 'get_equipment_shortages',
-    description: 'Obtener escaseces de equipos — items que tienen demanda mayor a la disponibilidad.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'number', description: 'Cantidad máxima de resultados (default 50)' },
-      },
-    },
-  },
-  {
-    name: 'get_crew',
-    description: 'Obtener lista de personal (crew members) de Rentman.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'number', description: 'Cantidad máxima de resultados (default 50)' },
-      },
-    },
-  },
-  {
-    name: 'get_crew_planning',
-    description: 'Obtener planificación y asignaciones de personal a proyectos.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'number', description: 'Cantidad máxima de resultados (default 50)' },
-      },
-    },
-  },
-  {
-    name: 'get_time_registrations',
-    description: 'Obtener registros de tiempo trabajado por el personal.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'number', description: 'Cantidad máxima de resultados (default 50)' },
-      },
-    },
-  },
-  {
-    name: 'get_contacts',
-    description: 'Obtener contactos y clientes de Rentman.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'number', description: 'Cantidad máxima de resultados (default 50)' },
-      },
-    },
-  },
-];
+const TOOLS = [ /* ... igual que antes ... */ ];
 
 // Execute tool
-async function executeTool(name, args) {
-  const limit = args.limit || 50;
-  try {
-    switch (name) {
-      case 'get_projects': {
-        const data = await rentmanRequest(`/projects?limit=${limit}`);
-        return data;
-      }
-      case 'get_project': {
-        const data = await rentmanRequest(`/projects/${args.id}`);
-        return data;
-      }
-      case 'get_invoices': {
-        const data = await rentmanRequest(`/invoices?limit=${limit}`);
-        return data;
-      }
-      case 'get_invoice_lines': {
-        const data = await rentmanRequest(`/invoicelines?limit=${limit}`);
-        return data;
-      }
-      case 'get_equipment': {
-        const data = await rentmanRequest(`/equipment?limit=${limit}`);
-        return data;
-      }
-      case 'get_equipment_shortages': {
-        const data = await rentmanRequest(`/equipment/shortages?limit=${limit}`);
-        return data;
-      }
-      case 'get_crew': {
-        const data = await rentmanRequest(`/crewmembers?limit=${limit}`);
-        return data;
-      }
-      case 'get_crew_planning': {
-        const data = await rentmanRequest(`/projectcrew?limit=${limit}`);
-        return data;
-      }
-      case 'get_time_registrations': {
-        const data = await rentmanRequest(`/time?limit=${limit}`);
-        return data;
-      }
-      case 'get_contacts': {
-        const data = await rentmanRequest(`/contacts?limit=${limit}`);
-        return data;
-      }
-      default:
-        return { error: `Tool ${name} not found` };
-    }
-  } catch (e) {
-    return { error: e.message };
-  }
-}
+async function executeTool(name, args) { /* ... igual que antes ... */ }
 
-// MCP over HTTP (SSE transport)
+// Sessions store
+const sessions = {};
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
@@ -209,69 +57,87 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // SSE endpoint for MCP
+  // ✅ SSE endpoint — el handshake correcto
   if (req.method === 'GET' && url.pathname === '/sse') {
+    const sessionId = Date.now().toString(36) + Math.random().toString(36).slice(2);
+
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no', // importante para Railway/nginx
     });
 
-    // Send server info
-    const serverInfo = {
-      jsonrpc: '2.0',
-      method: 'notifications/initialized',
-      params: {
-        serverInfo: { name: 'rentman-mcp', version: '1.0.0' },
-        capabilities: { tools: {} },
-      },
-    };
-    res.write(`data: ${JSON.stringify(serverInfo)}\n\n`);
+    // ✅ PRIMER EVENTO: decirle a Claude dónde enviar los mensajes
+    res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
 
-    req.on('close', () => res.end());
+    // Guardar la sesión con su res para poder enviarle eventos
+    sessions[sessionId] = res;
+
+    // Heartbeat para mantener la conexión viva en Railway
+    const heartbeat = setInterval(() => {
+      res.write(': ping\n\n');
+    }, 30000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      delete sessions[sessionId];
+    });
+
     return;
   }
 
-  // Main MCP POST endpoint
-  if (req.method === 'POST' && url.pathname === '/mcp') {
+  // ✅ Endpoint de mensajes MCP
+  if (req.method === 'POST' && url.pathname === '/messages') {
+    const sessionId = url.searchParams.get('sessionId');
+    const sseRes = sessions[sessionId];
+
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
         const msg = JSON.parse(body);
-        let response;
+        let result;
 
         if (msg.method === 'initialize') {
-          response = {
-            jsonrpc: '2.0', id: msg.id,
-            result: {
-              protocolVersion: '2024-11-05',
-              serverInfo: { name: 'rentman-mcp', version: '1.0.0' },
-              capabilities: { tools: {} },
-            },
+          result = {
+            protocolVersion: '2024-11-05',
+            serverInfo: { name: 'rentman-mcp', version: '1.0.0' },
+            capabilities: { tools: {} },
           };
+        } else if (msg.method === 'notifications/initialized') {
+          // notificación sin respuesta
+          res.writeHead(202);
+          res.end();
+          return;
         } else if (msg.method === 'tools/list') {
-          response = {
-            jsonrpc: '2.0', id: msg.id,
-            result: { tools: TOOLS },
-          };
+          result = { tools: TOOLS };
         } else if (msg.method === 'tools/call') {
-          const result = await executeTool(msg.params.name, msg.params.arguments || {});
-          response = {
-            jsonrpc: '2.0', id: msg.id,
-            result: {
-              content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-            },
+          const toolResult = await executeTool(msg.params.name, msg.params.arguments || {});
+          result = {
+            content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }],
           };
         } else {
-          response = {
+          // Responder con error JSON-RPC
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
             jsonrpc: '2.0', id: msg.id,
             error: { code: -32601, message: 'Method not found' },
-          };
+          }));
+          return;
         }
 
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(response));
+        const response = { jsonrpc: '2.0', id: msg.id, result };
+
+        // ✅ Enviar la respuesta por SSE al cliente
+        if (sseRes) {
+          sseRes.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+        }
+
+        // Confirmar recepción con 202
+        res.writeHead(202);
+        res.end();
+
       } catch (e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
