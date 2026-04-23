@@ -4,8 +4,7 @@ const https = require('https');
 const PORT = process.env.PORT || 3131;
 const RENTMAN_BASE = 'api.rentman.net';
 
-server.listen(PORT, '0.0.0.0', () => {
-  // CORS headers
+const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept');
@@ -16,15 +15,11 @@ server.listen(PORT, '0.0.0.0', () => {
     return;
   }
 
-  // Forward request to Rentman
   const options = {
     hostname: RENTMAN_BASE,
     path: req.url,
     method: req.method,
-    headers: {
-      ...req.headers,
-      host: RENTMAN_BASE,
-    },
+    headers: { ...req.headers, host: RENTMAN_BASE },
   };
 
   const proxyReq = https.request(options, (proxyRes) => {
@@ -43,7 +38,6 @@ server.listen(PORT, '0.0.0.0', () => {
   req.pipe(proxyReq);
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Rentman proxy corriendo en http://localhost:${PORT}`);
-  console.log(`   Ejemplo: http://localhost:${PORT}/projects`);
 });
