@@ -68,8 +68,11 @@ function ok(data) {
   return { content: [{ type: "text", text: JSON.stringify({ count: Array.isArray(data) ? data.length : 1, data }) }] };
 }
 
-// ─── MCP Server ───────────────────────────────────────────────────────────────
-const mcp = new McpServer({ name: "rentman-full", version: "3.0.0" });
+// ─── MCP Server Factory ───────────────────────────────────────────────────────
+// Each SSE connection gets its own McpServer instance to avoid the
+// "Already connected to a transport" error on reconnects.
+function createMcpServer() {
+  const mcp = new McpServer({ name: "rentman-full", version: "3.0.0" });
 
 // ══════════════════════════════════════════════════════════════════════════════
 // PROJECTS
@@ -1172,28 +1175,34 @@ mcp.tool("get_folders", "Carpetas de plantillas. itemtype: equipment|contact|veh
   async (args) => ok(await fetchAll("/folders", baseParams(args), args.max_pages))
 );
 
+  return mcp;
+} // end createMcpServer
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Express + SSE
 // ──────────────────────────────────────────────────────────────────────────────
 const app = express();
-const transports = {};
+
+// Map sessionId → { transport, server } so each connection is independent
+const sessions = {};
 
 app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
-  transports[transport.sessionId] = transport;
-  res.on("close", () => delete transports[transport.sessionId]);
-  await mcp.connect(transport);
+  const server = createMcpServer(); // fresh instance per connection
+  sessions[transport.sessionId] = { transport, server };
+  res.on("close", () => delete sessions[transport.sessionId]);
+  await server.connect(transport);
 });
 
 app.post("/messages", express.json(), async (req, res) => {
   const sessionId = new URL(req.url, "http://localhost").searchParams.get("sessionId");
-  const transport = transports[sessionId];
-  if (!transport) return res.status(404).json({ error: "Session not found" });
-  await transport.handlePostMessage(req, res, req.body);
+  const session = sessions[sessionId];
+  if (!session) return res.status(404).json({ error: "Session not found" });
+  await session.transport.handlePostMessage(req, res, req.body);
 });
 
 app.get("/health", (_, res) =>
-  res.json({ status: "ok", version: "3.0.0", tools: Object.keys(mcp._registeredTools || {}).length })
+  res.json({ status: "ok", version: "3.0.0", activeSessions: Object.keys(sessions).length })
 );
 
 const PORT = process.env.PORT || 3000;
