@@ -1,755 +1,1200 @@
-const http = require('http');
-const https = require('https');
-
-const PORT = process.env.PORT || 8080;
-const RENTMAN_BASE = 'api.rentman.net';
-const RENTMAN_TOKEN = process.env.RENTMAN_TOKEN || '';
-
-// ─── HTTP helper (sin cambios respecto al original) ───────────────────────────
-
-function rentmanRequest(path, method = 'GET', body = null) {
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: RENTMAN_BASE,
-      path: path,
-      method: method,
-      headers: {
-        'Authorization': `Bearer ${RENTMAN_TOKEN}`,
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-      },
-    };
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { resolve({ raw: data }); }
-      });
-    });
-    req.on('error', reject);
-    if (body) req.write(JSON.stringify(body));
-    req.end();
-  });
-}
-
-// ─── Nuevo helper: construye query string con filtros ─────────────────────────
-
-function buildQuery(params = {}) {
-  const q = new URLSearchParams();
-  if (params.limit != null) q.set('limit', params.limit);
-  if (params.offset != null) q.set('offset', params.offset);
-  if (params.sort) q.set('sort', params.sort);
-  if (params.filters) {
-    for (const [field, ops] of Object.entries(params.filters)) {
-      if (ops == null) continue;
-      if (typeof ops === 'object') {
-        for (const [op, val] of Object.entries(ops)) {
-          if (val != null && val !== '') q.set(`filter[${field}][${op}]`, val);
-        }
-      } else {
-        q.set(`filter[${field}][eq]`, ops);
-      }
-    }
-  }
-  const str = q.toString();
-  return str ? '?' + str : '';
-}
-
-// ─── Definición de herramientas ───────────────────────────────────────────────
-
-const TOOLS = [
-
-  // ── Proyectos ──────────────────────────────────────────────────────────────
-
-  {
-    name: 'get_projects',
-    description: 'Obtener lista de proyectos de Rentman. Soporta filtros por fecha, estado y nombre.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number', description: 'Maximo de resultados (default 50, max 1500)' },
-        offset:      { type: 'number', description: 'Desplazamiento para paginacion' },
-        sort:        { type: 'string', description: 'Campo de orden. Prefijo - para DESC. Ej: -planperiod_start' },
-        fecha_desde: { type: 'string', description: 'Fecha inicio minima ISO 8601, ej: 2026-04-01T00:00:00' },
-        fecha_hasta: { type: 'string', description: 'Fecha inicio maxima ISO 8601, ej: 2026-04-30T23:59:59' },
-        estado:      { type: 'string', description: 'Estado: option | confirmed | pencil | cancelled | inquiry | not_confirmed' },
-        nombre:      { type: 'string', description: 'Filtrar por nombre (busqueda parcial)' },
-        responsable: { type: 'string', description: 'Path del responsable, ej: /crew/5' },
-      },
-    },
-  },
-  {
-    name: 'get_project',
-    description: 'Obtener detalle de un proyecto por ID.',
-    inputSchema: {
-      type: 'object',
-      properties: { id: { type: 'number', description: 'ID del proyecto' } },
-      required: ['id'],
-    },
-  },
-  {
-    name: 'get_confirmed_projects_this_month',
-    description: 'Atajo: devuelve proyectos confirmados del mes y anio indicados.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        anio:  { type: 'number', description: 'Anio, ej: 2026' },
-        mes:   { type: 'number', description: 'Mes 1-12, ej: 4 para abril' },
-        limit: { type: 'number', description: 'Maximo de resultados (default 200)' },
-      },
-    },
-  },
-
-  // ── Contactos ──────────────────────────────────────────────────────────────
-
-  {
-    name: 'get_contacts',
-    description: 'Obtener contactos y clientes. Soporta filtro por nombre y ciudad.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:  { type: 'number', description: 'Maximo de resultados (default 50)' },
-        offset: { type: 'number', description: 'Desplazamiento para paginacion' },
-        nombre: { type: 'string', description: 'Filtrar por nombre o empresa (parcial)' },
-        ciudad: { type: 'string', description: 'Filtrar por ciudad' },
-      },
-    },
-  },
-  {
-    name: 'get_contact',
-    description: 'Obtener detalle de un contacto por ID.',
-    inputSchema: {
-      type: 'object',
-      properties: { id: { type: 'number', description: 'ID del contacto' } },
-      required: ['id'],
-    },
-  },
-
-  // ── Personal ───────────────────────────────────────────────────────────────
-
-  {
-    name: 'get_crew',
-    description: 'Obtener lista de personal. Soporta filtro por nombre.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:  { type: 'number', description: 'Maximo de resultados (default 50)' },
-        offset: { type: 'number', description: 'Desplazamiento para paginacion' },
-        nombre: { type: 'string', description: 'Filtrar por nombre' },
-      },
-    },
-  },
-  {
-    name: 'get_crew_planning',
-    description: 'Obtener planificacion de personal. Soporta filtro por proyecto y fechas.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number', description: 'Maximo de resultados (default 50)' },
-        offset:      { type: 'number', description: 'Desplazamiento para paginacion' },
-        fecha_desde: { type: 'string', description: 'Fecha minima ISO 8601' },
-        fecha_hasta: { type: 'string', description: 'Fecha maxima ISO 8601' },
-        proyecto_id: { type: 'number', description: 'Filtrar por ID de proyecto' },
-        crew_id:     { type: 'number', description: 'Filtrar por ID de miembro' },
-      },
-    },
-  },
-  {
-    name: 'get_project_crew',
-    description: 'Listar asignaciones de personal a proyectos.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number', description: 'Maximo de resultados (default 50)' },
-        offset:      { type: 'number', description: 'Desplazamiento para paginacion' },
-        proyecto_id: { type: 'number', description: 'Filtrar por ID de proyecto' },
-      },
-    },
-  },
-
-  // ── Equipos ────────────────────────────────────────────────────────────────
-
-  {
-    name: 'get_equipment',
-    description: 'Obtener inventario de equipos. Soporta filtro por nombre y codigo.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:  { type: 'number', description: 'Maximo de resultados (default 50)' },
-        offset: { type: 'number', description: 'Desplazamiento para paginacion' },
-        nombre: { type: 'string', description: 'Filtrar por nombre del equipo' },
-        codigo: { type: 'string', description: 'Filtrar por codigo/referencia' },
-      },
-    },
-  },
-  {
-    name: 'get_equipment_item',
-    description: 'Obtener detalle de un equipo por ID.',
-    inputSchema: {
-      type: 'object',
-      properties: { id: { type: 'number', description: 'ID del equipo' } },
-      required: ['id'],
-    },
-  },
-  {
-    name: 'get_equipment_shortages',
-    description: 'Obtener escaseces de equipos. Soporta filtro por fechas.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number', description: 'Maximo de resultados (default 50)' },
-        fecha_desde: { type: 'string', description: 'Fecha minima ISO 8601' },
-        fecha_hasta: { type: 'string', description: 'Fecha maxima ISO 8601' },
-        equipo_id:   { type: 'number', description: 'Filtrar por ID de equipo' },
-      },
-    },
-  },
-  {
-    name: 'get_project_equipment',
-    description: 'Listar equipos asignados a un proyecto.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number', description: 'Maximo de resultados (default 50)' },
-        offset:      { type: 'number', description: 'Desplazamiento para paginacion' },
-        proyecto_id: { type: 'number', description: 'Filtrar por ID de proyecto' },
-        equipo_id:   { type: 'number', description: 'Filtrar por ID de equipo' },
-      },
-    },
-  },
-  {
-    name: 'get_equipment_sets',
-    description: 'Listar sets/grupos de equipos.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:  { type: 'number', description: 'Maximo de resultados (default 50)' },
-        nombre: { type: 'string', description: 'Filtrar por nombre del set' },
-      },
-    },
-  },
-
-  // ── Facturas ───────────────────────────────────────────────────────────────
-
-  {
-    name: 'get_invoices',
-    description: 'Obtener facturas de Rentman. Soporta filtros por estado, fecha y proyecto.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number', description: 'Maximo de resultados (default 50)' },
-        offset:      { type: 'number', description: 'Desplazamiento para paginacion' },
-        fecha_desde: { type: 'string', description: 'Fecha minima ISO 8601' },
-        fecha_hasta: { type: 'string', description: 'Fecha maxima ISO 8601' },
-        estado:      { type: 'string', description: 'Estado: draft | sent | paid | overdue | cancelled' },
-        proyecto_id: { type: 'number', description: 'Filtrar por ID de proyecto' },
-      },
-    },
-  },
-  {
-    name: 'get_invoice',
-    description: 'Obtener detalle de una factura por ID.',
-    inputSchema: {
-      type: 'object',
-      properties: { id: { type: 'number', description: 'ID de la factura' } },
-      required: ['id'],
-    },
-  },
-  {
-    name: 'get_invoice_lines',
-    description: 'Obtener lineas de factura detalladas. Soporta filtro por factura y proyecto.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number', description: 'Maximo de resultados (default 50)' },
-        factura_id:  { type: 'number', description: 'Filtrar por ID de factura' },
-        proyecto_id: { type: 'number', description: 'Filtrar por ID de proyecto' },
-      },
-    },
-  },
-  {
-    name: 'get_quotes',
-    description: 'Listar cotizaciones/presupuestos.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number', description: 'Maximo de resultados (default 50)' },
-        fecha_desde: { type: 'string', description: 'Fecha minima ISO 8601' },
-        fecha_hasta: { type: 'string', description: 'Fecha maxima ISO 8601' },
-        proyecto_id: { type: 'number', description: 'Filtrar por ID de proyecto' },
-      },
-    },
-  },
-  {
-    name: 'get_quote_lines',
-    description: 'Obtener lineas de cotizacion.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:         { type: 'number', description: 'Maximo de resultados (default 50)' },
-        cotizacion_id: { type: 'number', description: 'Filtrar por ID de cotizacion' },
-        proyecto_id:   { type: 'number', description: 'Filtrar por ID de proyecto' },
-      },
-    },
-  },
-
-  // ── Operaciones ────────────────────────────────────────────────────────────
-
-  {
-    name: 'get_time_registrations',
-    description: 'Obtener registros de tiempo trabajado. Soporta filtro por proyecto y fechas.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number', description: 'Maximo de resultados (default 50)' },
-        offset:      { type: 'number', description: 'Desplazamiento para paginacion' },
-        fecha_desde: { type: 'string', description: 'Fecha minima ISO 8601' },
-        fecha_hasta: { type: 'string', description: 'Fecha maxima ISO 8601' },
-        proyecto_id: { type: 'number', description: 'Filtrar por ID de proyecto' },
-        crew_id:     { type: 'number', description: 'Filtrar por ID de miembro del personal' },
-      },
-    },
-  },
-  {
-    name: 'get_subrentals',
-    description: 'Listar subarriendos de equipos a proveedores externos.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:        { type: 'number', description: 'Maximo de resultados (default 50)' },
-        fecha_desde:  { type: 'string', description: 'Fecha minima ISO 8601' },
-        fecha_hasta:  { type: 'string', description: 'Fecha maxima ISO 8601' },
-        proyecto_id:  { type: 'number', description: 'Filtrar por ID de proyecto' },
-        proveedor_id: { type: 'number', description: 'Filtrar por ID de proveedor' },
-      },
-    },
-  },
-  {
-    name: 'get_tasks',
-    description: 'Listar tareas con filtros por proyecto, responsable y estado.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number',  description: 'Maximo de resultados (default 50)' },
-        fecha_desde: { type: 'string',  description: 'Fecha de vencimiento minima ISO 8601' },
-        fecha_hasta: { type: 'string',  description: 'Fecha de vencimiento maxima ISO 8601' },
-        proyecto_id: { type: 'number',  description: 'Filtrar por ID de proyecto' },
-        asignado_a:  { type: 'number',  description: 'Filtrar por ID de miembro del personal' },
-        completada:  { type: 'boolean', description: 'true = completadas, false = pendientes' },
-      },
-    },
-  },
-  {
-    name: 'get_vehicles',
-    description: 'Listar vehiculos disponibles.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:  { type: 'number', description: 'Maximo de resultados (default 50)' },
-        nombre: { type: 'string', description: 'Filtrar por nombre o patente' },
-      },
-    },
-  },
-  {
-    name: 'get_vehicle_planning',
-    description: 'Obtener planificacion/reservas de vehiculos.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit:       { type: 'number', description: 'Maximo de resultados (default 50)' },
-        fecha_desde: { type: 'string', description: 'Fecha minima ISO 8601' },
-        fecha_hasta: { type: 'string', description: 'Fecha maxima ISO 8601' },
-        vehiculo_id: { type: 'number', description: 'Filtrar por ID de vehiculo' },
-        proyecto_id: { type: 'number', description: 'Filtrar por ID de proyecto' },
-      },
-    },
-  },
-
-  // ── Catalogos ──────────────────────────────────────────────────────────────
-
-  {
-    name: 'get_project_types',
-    description: 'Listar tipos de proyecto disponibles.',
-    inputSchema: {
-      type: 'object',
-      properties: { limit: { type: 'number', description: 'Maximo de resultados (default 50)' } },
-    },
-  },
-  {
-    name: 'get_folders',
-    description: 'Listar carpetas de organizacion de equipos.',
-    inputSchema: {
-      type: 'object',
-      properties: { limit: { type: 'number', description: 'Maximo de resultados (default 50)' } },
-    },
-  },
-];
-
-// ─── Ejecución de herramientas ────────────────────────────────────────────────
-
-async function executeTool(name, args) {
-  const limit = args.limit || 50;
-  const offset = args.offset || null;
-
-  try {
-    switch (name) {
-
-      case 'get_projects':
-        return await rentmanRequest('/projects' + buildQuery({
-          limit, offset,
-          sort: args.sort || '-planperiod_start',
-          filters: {
-            planperiod_start: {
-              ...(args.fecha_desde ? { gte: args.fecha_desde } : {}),
-              ...(args.fecha_hasta ? { lte: args.fecha_hasta } : {}),
-            },
-            ...(args.estado      ? { status:          { eq: args.estado } }                : {}),
-            ...(args.nombre      ? { name:             { like: `%${args.nombre}%` } }       : {}),
-            ...(args.responsable ? { account_manager:  { eq: args.responsable } }           : {}),
-          },
-        }));
-
-      case 'get_project':
-        return await rentmanRequest(`/projects/${args.id}`);
-
-      case 'get_confirmed_projects_this_month': {
-        const anio = args.anio || new Date().getFullYear();
-        const mes  = args.mes  || (new Date().getMonth() + 1);
-        const pad  = (n) => String(n).padStart(2, '0');
-        const days = new Date(anio, mes, 0).getDate();
-        return await rentmanRequest('/projects' + buildQuery({
-          limit: args.limit || 200,
-          sort: 'planperiod_start',
-          filters: {
-            planperiod_start: {
-              gte: `${anio}-${pad(mes)}-01T00:00:00`,
-              lte: `${anio}-${pad(mes)}-${days}T23:59:59`,
-            },
-            status: { eq: 'confirmed' },
-          },
-        }));
-      }
-
-      case 'get_contacts':
-        return await rentmanRequest('/contacts' + buildQuery({
-          limit, offset,
-          filters: {
-            ...(args.nombre ? { displayname: { like: `%${args.nombre}%` } } : {}),
-            ...(args.ciudad ? { city:        { like: `%${args.ciudad}%` } } : {}),
-          },
-        }));
-
-      case 'get_contact':
-        return await rentmanRequest(`/contacts/${args.id}`);
-
-      case 'get_crew':
-        return await rentmanRequest('/crewmembers' + buildQuery({   // ruta original preservada
-          limit, offset,
-          filters: {
-            ...(args.nombre ? { displayname: { like: `%${args.nombre}%` } } : {}),
-          },
-        }));
-
-      case 'get_crew_planning':
-        return await rentmanRequest('/crewplanning' + buildQuery({
-          limit, offset,
-          filters: {
-            ...(args.fecha_desde ? { start:   { gte: args.fecha_desde } }                    : {}),
-            ...(args.fecha_hasta ? { end:     { lte: args.fecha_hasta } }                    : {}),
-            ...(args.proyecto_id ? { project: { eq: `/projects/${args.proyecto_id}` } }      : {}),
-            ...(args.crew_id     ? { crew:    { eq: `/crewmembers/${args.crew_id}` } }        : {}),
-          },
-        }));
-
-      case 'get_project_crew':
-        return await rentmanRequest('/projectcrew' + buildQuery({   // ruta original preservada
-          limit, offset,
-          filters: {
-            ...(args.proyecto_id ? { project: { eq: `/projects/${args.proyecto_id}` } } : {}),
-          },
-        }));
-
-      case 'get_equipment':
-        return await rentmanRequest('/equipment' + buildQuery({
-          limit, offset,
-          filters: {
-            ...(args.nombre ? { name: { like: `%${args.nombre}%` } } : {}),
-            ...(args.codigo ? { code: { like: `%${args.codigo}%` } } : {}),
-          },
-        }));
-
-      case 'get_equipment_item':
-        return await rentmanRequest(`/equipment/${args.id}`);
-
-      case 'get_equipment_shortages':
-        return await rentmanRequest('/equipment/shortages' + buildQuery({   // ruta original preservada
-          limit,
-          filters: {
-            ...(args.fecha_desde ? { start:     { gte: args.fecha_desde } }               : {}),
-            ...(args.fecha_hasta ? { end:       { lte: args.fecha_hasta } }               : {}),
-            ...(args.equipo_id   ? { equipment: { eq: `/equipment/${args.equipo_id}` } }  : {}),
-          },
-        }));
-
-      case 'get_project_equipment':
-        return await rentmanRequest('/projectequipment' + buildQuery({
-          limit, offset,
-          filters: {
-            ...(args.proyecto_id ? { project:   { eq: `/projects/${args.proyecto_id}` } }  : {}),
-            ...(args.equipo_id   ? { equipment: { eq: `/equipment/${args.equipo_id}` } }    : {}),
-          },
-        }));
-
-      case 'get_equipment_sets':
-        return await rentmanRequest('/equipmentsets' + buildQuery({
-          limit,
-          filters: {
-            ...(args.nombre ? { name: { like: `%${args.nombre}%` } } : {}),
-          },
-        }));
-
-      case 'get_invoices':
-        return await rentmanRequest('/invoices' + buildQuery({
-          limit, offset,
-          sort: args.sort || '-date',
-          filters: {
-            ...(args.fecha_desde ? { date:    { gte: args.fecha_desde } }                : {}),
-            ...(args.fecha_hasta ? { date:    { lte: args.fecha_hasta } }                : {}),
-            ...(args.estado      ? { status:  { eq: args.estado } }                      : {}),
-            ...(args.proyecto_id ? { project: { eq: `/projects/${args.proyecto_id}` } }  : {}),
-          },
-        }));
-
-      case 'get_invoice':
-        return await rentmanRequest(`/invoices/${args.id}`);
-
-      case 'get_invoice_lines':
-        return await rentmanRequest('/invoicelines' + buildQuery({
-          limit,
-          filters: {
-            ...(args.factura_id  ? { invoice: { eq: `/invoices/${args.factura_id}` } }    : {}),
-            ...(args.proyecto_id ? { project: { eq: `/projects/${args.proyecto_id}` } }   : {}),
-          },
-        }));
-
-      case 'get_quotes':
-        return await rentmanRequest('/quotes' + buildQuery({
-          limit,
-          filters: {
-            ...(args.fecha_desde ? { date:    { gte: args.fecha_desde } }                : {}),
-            ...(args.fecha_hasta ? { date:    { lte: args.fecha_hasta } }                : {}),
-            ...(args.proyecto_id ? { project: { eq: `/projects/${args.proyecto_id}` } }  : {}),
-          },
-        }));
-
-      case 'get_quote_lines':
-        return await rentmanRequest('/quotationlines' + buildQuery({
-          limit,
-          filters: {
-            ...(args.cotizacion_id ? { quote:   { eq: `/quotes/${args.cotizacion_id}` } }  : {}),
-            ...(args.proyecto_id   ? { project: { eq: `/projects/${args.proyecto_id}` } }  : {}),
-          },
-        }));
-
-      case 'get_time_registrations':
-        return await rentmanRequest('/time' + buildQuery({   // ruta original preservada
-          limit, offset,
-          filters: {
-            ...(args.fecha_desde ? { start:   { gte: args.fecha_desde } }                : {}),
-            ...(args.fecha_hasta ? { end:     { lte: args.fecha_hasta } }                : {}),
-            ...(args.proyecto_id ? { project: { eq: `/projects/${args.proyecto_id}` } }  : {}),
-            ...(args.crew_id     ? { crew:    { eq: `/crewmembers/${args.crew_id}` } }   : {}),
-          },
-        }));
-
-      case 'get_subrentals':
-        return await rentmanRequest('/subrentals' + buildQuery({
-          limit,
-          filters: {
-            ...(args.fecha_desde   ? { planperiod_start: { gte: args.fecha_desde } }             : {}),
-            ...(args.fecha_hasta   ? { planperiod_start: { lte: args.fecha_hasta } }             : {}),
-            ...(args.proyecto_id   ? { project:          { eq: `/projects/${args.proyecto_id}` } } : {}),
-            ...(args.proveedor_id  ? { contact:          { eq: `/contacts/${args.proveedor_id}` } } : {}),
-          },
-        }));
-
-      case 'get_tasks':
-        return await rentmanRequest('/tasks' + buildQuery({
-          limit,
-          filters: {
-            ...(args.fecha_desde ? { due_date: { gte: args.fecha_desde } }               : {}),
-            ...(args.fecha_hasta ? { due_date: { lte: args.fecha_hasta } }               : {}),
-            ...(args.proyecto_id ? { project:  { eq: `/projects/${args.proyecto_id}` } } : {}),
-            ...(args.asignado_a  ? { assignee: { eq: `/crewmembers/${args.asignado_a}` } } : {}),
-            ...(args.completada != null ? { is_done: { eq: args.completada ? 1 : 0 } }  : {}),
-          },
-        }));
-
-      case 'get_vehicles':
-        return await rentmanRequest('/vehicles' + buildQuery({
-          limit,
-          filters: {
-            ...(args.nombre ? { name: { like: `%${args.nombre}%` } } : {}),
-          },
-        }));
-
-      case 'get_vehicle_planning':
-        return await rentmanRequest('/vehicleplanning' + buildQuery({
-          limit,
-          filters: {
-            ...(args.fecha_desde ? { start:   { gte: args.fecha_desde } }                : {}),
-            ...(args.fecha_hasta ? { end:     { lte: args.fecha_hasta } }                : {}),
-            ...(args.vehiculo_id ? { vehicle: { eq: `/vehicles/${args.vehiculo_id}` } }  : {}),
-            ...(args.proyecto_id ? { project: { eq: `/projects/${args.proyecto_id}` } }  : {}),
-          },
-        }));
-
-      case 'get_project_types':
-        return await rentmanRequest(`/projecttypes?limit=${limit}`);
-
-      case 'get_folders':
-        return await rentmanRequest(`/folders?limit=${limit}`);
-
-      default:
-        return { error: `Tool ${name} not found` };
-    }
-  } catch (e) {
-    return { error: e.message };
-  }
-}
-
-// ─── Servidor HTTP (misma lógica SSE que el original, sin cambios) ────────────
-
-const sessions = {};
-
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, Mcp-Session-Id');
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  if (req.method === 'GET' && url.pathname === '/sse') {
-    const sessionId = Date.now().toString(36) + Math.random().toString(36).slice(2);
-    console.log(`[SSE] Nueva conexion. SessionId: ${sessionId}`);
-
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-      'Access-Control-Allow-Origin': '*',
-    });
-
-    res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
-    console.log(`[SSE] Endpoint event enviado: /messages?sessionId=${sessionId}`);
-
-    sessions[sessionId] = res;
-
-    const heartbeat = setInterval(() => {
-      res.write(': ping\n\n');
-    }, 25000);
-
-    req.on('close', () => {
-      console.log(`[SSE] Conexion cerrada. SessionId: ${sessionId}`);
-      clearInterval(heartbeat);
-      delete sessions[sessionId];
-    });
-
-    return;
-  }
-
-  if (req.method === 'POST' && url.pathname === '/messages') {
-    const sessionId = url.searchParams.get('sessionId');
-    const sseRes = sessions[sessionId];
-    console.log(`[MSG] POST /messages | sessionId: ${sessionId} | sseActivo: ${!!sseRes}`);
-
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
-      try {
-        const msg = JSON.parse(body);
-        console.log(`[MSG] Metodo: ${msg.method} | id: ${msg.id}`);
-
-        if (msg.id === undefined || msg.id === null) {
-          console.log(`[MSG] Notificacion sin id: ${msg.method}`);
-          res.writeHead(202);
-          res.end();
-          return;
-        }
-
-        let result;
-
-        if (msg.method === 'initialize') {
-          result = {
-            protocolVersion: '2024-11-05',
-            serverInfo: { name: 'rentman-mcp', version: '2.0.0' },
-            capabilities: { tools: {} },
-          };
-          console.log(`[MSG] Initialize OK`);
-
-        } else if (msg.method === 'tools/list') {
-          result = { tools: TOOLS };
-          console.log(`[MSG] tools/list: enviando ${TOOLS.length} tools`);
-
-        } else if (msg.method === 'tools/call') {
-          console.log(`[MSG] tools/call: ${msg.params.name}`);
-          const toolResult = await executeTool(msg.params.name, msg.params.arguments || {});
-          result = {
-            content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }],
-          };
-
-        } else {
-          const errorResp = { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'Method not found' } };
-          console.log(`[MSG] Metodo desconocido: ${msg.method}`);
-          if (sseRes) sseRes.write(`event: message\ndata: ${JSON.stringify(errorResp)}\n\n`);
-          res.writeHead(202);
-          res.end();
-          return;
-        }
-
-        const response = { jsonrpc: '2.0', id: msg.id, result };
-
-        if (sseRes) {
-          sseRes.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
-          console.log(`[MSG] Respuesta enviada por SSE`);
-        } else {
-          console.log(`[MSG] WARNING: sseRes no encontrado para sessionId: ${sessionId}`);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(response));
-          return;
-        }
-
-        res.writeHead(202);
-        res.end();
-
-      } catch (e) {
-        console.log(`[MSG] Error parseando mensaje: ${e.message}`);
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  if (url.pathname === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', name: 'rentman-mcp', version: '2.0.0', tools: TOOLS.length }));
-    return;
-  }
-
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end('Not found');
+import express from "express";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+const RENTMAN_TOKEN = process.env.RENTMAN_TOKEN;
+const BASE_URL = "https://api.rentman.net";
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const headers = () => ({
+  Authorization: `Bearer ${RENTMAN_TOKEN}`,
+  "Content-Type": "application/json",
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Rentman MCP server v2.0 corriendo en puerto ${PORT}`);
-  console.log(`   Tools disponibles (${TOOLS.length}): ${TOOLS.map(t => t.name).join(', ')}`);
+/**
+ * Fetch a collection with automatic cursor-based pagination.
+ * Follows next_page_url until null or maxPages is reached.
+ */
+async function fetchAll(endpoint, params = {}, maxPages = 10) {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
+  }
+  if (!qs.has("limit")) qs.set("limit", "300");
+
+  let url = `${BASE_URL}${endpoint}?${qs.toString()}`;
+  let all = [];
+  let page = 0;
+
+  while (url && page < maxPages) {
+    const res = await fetch(url, { headers: headers() });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Rentman ${res.status} @ ${endpoint}: ${err}`);
+    }
+    const json = await res.json();
+    all = all.concat(json.data || []);
+    url = json.next_page_url || null;
+    page++;
+  }
+  return all;
+}
+
+/** Fetch a single item by full path (e.g. /projects/42) */
+async function fetchOne(path) {
+  const res = await fetch(`${BASE_URL}${path}`, { headers: headers() });
+  if (!res.ok) throw new Error(`Rentman ${res.status} @ ${path}`);
+  return (await res.json()).data;
+}
+
+/** Build common pagination/field params */
+function baseParams(args) {
+  const p = {};
+  if (args.limit)     p.limit  = args.limit;
+  if (args.sort)      p.sort   = args.sort;
+  if (args.fields)    p.fields = args.fields;
+  return p;
+}
+
+/** Append date range filters like planperiod_start[gte] */
+function dateRange(p, field, gte, lte) {
+  if (gte) p[`${field}[gte]`] = gte;
+  if (lte) p[`${field}[lte]`] = lte;
+}
+
+function ok(data) {
+  return { content: [{ type: "text", text: JSON.stringify({ count: Array.isArray(data) ? data.length : 1, data }) }] };
+}
+
+// ─── MCP Server ───────────────────────────────────────────────────────────────
+const mcp = new McpServer({ name: "rentman-full", version: "3.0.0" });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROJECTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_projects",
+  "Obtener lista de proyectos. Soporta filtros por fechas de plan/uso, estado, nombre y paginación automática.",
+  {
+    planperiod_start_gte:  z.string().optional().describe("planperiod_start >= (ISO 8601)"),
+    planperiod_start_lte:  z.string().optional().describe("planperiod_start <="),
+    planperiod_end_gte:    z.string().optional().describe("planperiod_end >="),
+    planperiod_end_lte:    z.string().optional().describe("planperiod_end <="),
+    usageperiod_start_gte: z.string().optional().describe("usageperiod_start >="),
+    usageperiod_start_lte: z.string().optional().describe("usageperiod_start <="),
+    usageperiod_end_gte:   z.string().optional().describe("usageperiod_end >="),
+    usageperiod_end_lte:   z.string().optional().describe("usageperiod_end <="),
+    status:    z.string().optional().describe("Estado del proyecto"),
+    name:      z.string().optional().describe("Nombre exacto del proyecto"),
+    number:    z.string().optional().describe("Número del proyecto"),
+    sort:      z.string().optional().default("-id").describe("Ordenamiento ej: -planperiod_start"),
+    fields:    z.string().optional().describe("Campos separados por coma"),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "planperiod_start",  args.planperiod_start_gte,  args.planperiod_start_lte);
+    dateRange(p, "planperiod_end",    args.planperiod_end_gte,    args.planperiod_end_lte);
+    dateRange(p, "usageperiod_start", args.usageperiod_start_gte, args.usageperiod_start_lte);
+    dateRange(p, "usageperiod_end",   args.usageperiod_end_gte,   args.usageperiod_end_lte);
+    if (args.status) p.status = args.status;
+    if (args.name)   p.name   = args.name;
+    if (args.number) p.number = args.number;
+    return ok(await fetchAll("/projects", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_project", "Obtener detalle completo de un proyecto por ID.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/projects/${id}`))
+);
+
+mcp.tool("get_project_contracts", "Contratos asociados a un proyecto.",
+  { project_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, fields, max_pages }) => ok(await fetchAll(`/projects/${project_id}/contracts`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_project_costs", "Costos adicionales de un proyecto.",
+  { project_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, fields, max_pages }) => ok(await fetchAll(`/projects/${project_id}/costs`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_project_crew", "Crew planificado en un proyecto.",
+  { project_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, fields, max_pages }) => ok(await fetchAll(`/projects/${project_id}/projectcrew`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_project_equipment", "Equipos planificados en un proyecto.",
+  { project_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, fields, max_pages }) => ok(await fetchAll(`/projects/${project_id}/projectequipment`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_project_equipment_groups", "Grupos de equipos de un proyecto.",
+  { project_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, fields, max_pages }) => ok(await fetchAll(`/projects/${project_id}/projectequipmentgroup`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_project_function_groups", "Grupos de funciones de un proyecto.",
+  { project_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, fields, max_pages }) => ok(await fetchAll(`/projects/${project_id}/projectfunctiongroups`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_project_functions", "Funciones de crew de un proyecto.",
+  { project_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, fields, max_pages }) => ok(await fetchAll(`/projects/${project_id}/projectfunctions`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_project_vehicles", "Vehículos planificados en un proyecto.",
+  { project_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, fields, max_pages }) => ok(await fetchAll(`/projects/${project_id}/projectvehicles`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_project_quotes", "Cotizaciones de un proyecto.",
+  { project_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, fields, max_pages }) => ok(await fetchAll(`/projects/${project_id}/quotes`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_project_subprojects", "Subproyectos de un proyecto.",
+  { project_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, fields, max_pages }) => ok(await fetchAll(`/projects/${project_id}/subprojects`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_project_files", "Archivos adjuntos de un proyecto.",
+  { project_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ project_id, max_pages }) => ok(await fetchAll(`/projects/${project_id}/files`, {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SUBPROJECTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_subprojects",
+  "Obtener subproyectos con filtros de fecha y paginación.",
+  {
+    planperiod_start_gte:  z.string().optional(),
+    planperiod_start_lte:  z.string().optional(),
+    planperiod_end_gte:    z.string().optional(),
+    planperiod_end_lte:    z.string().optional(),
+    usageperiod_start_gte: z.string().optional(),
+    usageperiod_start_lte: z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "planperiod_start",  args.planperiod_start_gte, args.planperiod_start_lte);
+    dateRange(p, "planperiod_end",    args.planperiod_end_gte,   args.planperiod_end_lte);
+    dateRange(p, "usageperiod_start", args.usageperiod_start_gte, args.usageperiod_start_lte);
+    return ok(await fetchAll("/subprojects", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_subproject", "Detalle de un subproyecto.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/subprojects/${id}`))
+);
+
+mcp.tool("get_subproject_crew", "Crew de un subproyecto.",
+  { subproject_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ subproject_id, fields, max_pages }) => ok(await fetchAll(`/subprojects/${subproject_id}/projectcrew`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_subproject_equipment", "Equipos de un subproyecto.",
+  { subproject_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ subproject_id, fields, max_pages }) => ok(await fetchAll(`/subprojects/${subproject_id}/projectequipment`, fields ? { fields } : {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROJECT TYPES
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_project_types", "Tipos de proyecto disponibles. type: regular|supplier|transfer|shifts",
+  { fields: z.string().optional(), max_pages: z.number().optional().default(3) },
+  async ({ fields, max_pages }) => ok(await fetchAll("/projecttypes", fields ? { fields } : {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROJECT CREW (colección global)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_projectcrew",
+  "Planificación global de crew con filtros de fecha de planificación.",
+  {
+    planperiod_start_gte: z.string().optional().describe("planperiod_start >= (ISO 8601)"),
+    planperiod_start_lte: z.string().optional(),
+    planperiod_end_gte:   z.string().optional(),
+    planperiod_end_lte:   z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "planperiod_start", args.planperiod_start_gte, args.planperiod_start_lte);
+    dateRange(p, "planperiod_end",   args.planperiod_end_gte,   args.planperiod_end_lte);
+    return ok(await fetchAll("/projectcrew", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_projectcrew_item", "Detalle de una asignación de crew.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/projectcrew/${id}`))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROJECT EQUIPMENT (colección global)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_projectequipment",
+  "Equipos planificados globalmente con filtros de fecha.",
+  {
+    planperiod_start_gte: z.string().optional(),
+    planperiod_start_lte: z.string().optional(),
+    planperiod_end_gte:   z.string().optional(),
+    planperiod_end_lte:   z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "planperiod_start", args.planperiod_start_gte, args.planperiod_start_lte);
+    dateRange(p, "planperiod_end",   args.planperiod_end_gte,   args.planperiod_end_lte);
+    return ok(await fetchAll("/projectequipment", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_projectequipment_item", "Detalle de un ítem de equipo planificado.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/projectequipment/${id}`))
+);
+
+mcp.tool("get_projectequipmentgroup",
+  "Grupos de equipo planificados globalmente.",
+  {
+    sort: z.string().optional().default("-id"),
+    fields: z.string().optional(),
+    limit: z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => ok(await fetchAll("/projectequipmentgroup", baseParams(args), args.max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROJECT FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_projectfunctions",
+  "Funciones de crew globalmente. type: crew_function|transport_function|remark|shift",
+  {
+    planperiod_start_gte: z.string().optional(),
+    planperiod_start_lte: z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "planperiod_start", args.planperiod_start_gte, args.planperiod_start_lte);
+    return ok(await fetchAll("/projectfunctions", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_projectfunction_crew", "Crew de una función específica.",
+  { function_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ function_id, fields, max_pages }) => ok(await fetchAll(`/projectfunctions/${function_id}/projectcrew`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_projectfunctiongroups", "Grupos de funciones globalmente.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(10) },
+  async (args) => ok(await fetchAll("/projectfunctiongroups", baseParams(args), args.max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROJECT VEHICLES
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_projectvehicles",
+  "Vehículos planificados globalmente con filtros de fecha.",
+  {
+    planningperiod_start_gte: z.string().optional(),
+    planningperiod_start_lte: z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "planningperiod_start", args.planningperiod_start_gte, args.planningperiod_start_lte);
+    return ok(await fetchAll("/projectvehicles", p, args.max_pages));
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROJECT REQUESTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_projectrequests",
+  "Solicitudes de proyecto. status: accepted|declined|open. source: rentaround|rentman|zoef|api",
+  {
+    status:    z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    if (args.status) p.status = args.status;
+    return ok(await fetchAll("/projectrequests", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_projectrequest", "Detalle de una solicitud de proyecto.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/projectrequests/${id}`))
+);
+
+mcp.tool("get_projectrequest_equipment", "Equipos de una solicitud de proyecto.",
+  { request_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ request_id, fields, max_pages }) => ok(await fetchAll(`/projectrequests/${request_id}/projectrequestequipment`, fields ? { fields } : {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EQUIPMENT
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_equipment",
+  "Inventario de equipos. type: set|case|item. rental_sales: Sale|Rental. stock_management: Track stock | Exclude from stock tracking",
+  {
+    name:           z.string().optional(),
+    code:           z.string().optional(),
+    type:           z.string().optional().describe("set | case | item"),
+    rental_sales:   z.string().optional().describe("Sale | Rental"),
+    sort:           z.string().optional().default("+name"),
+    fields:         z.string().optional(),
+    limit:          z.number().optional().default(300),
+    max_pages:      z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    if (args.name)         p.name         = args.name;
+    if (args.code)         p.code         = args.code;
+    if (args.type)         p.type         = args.type;
+    if (args.rental_sales) p.rental_sales  = args.rental_sales;
+    return ok(await fetchAll("/equipment", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_equipment_item", "Detalle de un ítem de equipo.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/equipment/${id}`))
+);
+
+mcp.tool("get_equipment_accessories", "Accesorios de un equipo.",
+  { equipment_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ equipment_id, fields, max_pages }) => ok(await fetchAll(`/equipment/${equipment_id}/accessories`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_equipment_sets_content", "Contenido de un set/case de equipo.",
+  { equipment_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ equipment_id, fields, max_pages }) => ok(await fetchAll(`/equipment/${equipment_id}/equipmentsetscontent`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_equipment_serial_numbers", "Números de serie de un equipo.",
+  { equipment_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ equipment_id, fields, max_pages }) => ok(await fetchAll(`/equipment/${equipment_id}/serialnumbers`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_equipment_repairs", "Reparaciones de un equipo.",
+  { equipment_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ equipment_id, fields, max_pages }) => ok(await fetchAll(`/equipment/${equipment_id}/repairs`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_equipment_stock_movements", "Movimientos de stock de un equipo.",
+  { equipment_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ equipment_id, fields, max_pages }) => ok(await fetchAll(`/equipment/${equipment_id}/stockmovements`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_equipment_files", "Archivos de un equipo.",
+  { equipment_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ equipment_id, max_pages }) => ok(await fetchAll(`/equipment/${equipment_id}/files`, {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ACCESSORIES (colección global)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_accessories", "Lista global de accesorios.",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/accessories", baseParams(args), args.max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EQUIPMENT SETS CONTENT (colección global)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_equipmentsetscontent", "Contenido global de sets de equipo.",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/equipmentsetscontent", baseParams(args), args.max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SERIAL NUMBERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_serial_numbers", "Números de serie globalmente.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(10) },
+  async (args) => ok(await fetchAll("/serialnumbers", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_serial_number", "Detalle de un número de serie.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/serialnumbers/${id}`))
+);
+
+mcp.tool("get_serial_number_actual_content", "Contenido actual de un serial (combinaciones).",
+  { serial_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ serial_id, max_pages }) => ok(await fetchAll(`/serialnumbers/${serial_id}/actualcontent`, {}, max_pages))
+);
+
+mcp.tool("get_serial_number_assigned_serials", "Seriales asignados a un serial.",
+  { serial_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ serial_id, max_pages }) => ok(await fetchAll(`/serialnumbers/${serial_id}/equipmentassignedserials`, {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EQUIPMENT ASSIGNED SERIALS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_equipment_assigned_serials", "Seriales asignados globalmente.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/equipmentassignedserials", baseParams(args), args.max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ACTUAL CONTENT
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_actual_content", "Contenido actual de combinaciones serializadas.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/actualcontent", baseParams(args), args.max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REPAIRS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_repairs",
+  "Reparaciones. repair_status: in-progress|completed|unrepairable",
+  {
+    repair_status:       z.string().optional(),
+    repairperiod_start_gte: z.string().optional(),
+    repairperiod_start_lte: z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    if (args.repair_status) p.repair_status = args.repair_status;
+    dateRange(p, "repairperiod_start", args.repairperiod_start_gte, args.repairperiod_start_lte);
+    return ok(await fetchAll("/repairs", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_repair", "Detalle de una reparación.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/repairs/${id}`))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STOCK MOVEMENTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_stock_movements",
+  "Movimientos de stock. type: manual|equipment_lost|equipment_found|serial_created|serial_deleted|...",
+  {
+    date_gte:  z.string().optional().describe("date >= (ISO 8601)"),
+    date_lte:  z.string().optional().describe("date <="),
+    type:      z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "date", args.date_gte, args.date_lte);
+    if (args.type) p.type = args.type;
+    return ok(await fetchAll("/stockmovements", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_stock_movement", "Detalle de un movimiento de stock.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/stockmovements/${id}`))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STOCK LOCATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_stock_locations", "Ubicaciones de stock. type: plannable|nonplannable",
+  { type: z.string().optional(), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => {
+    const p = baseParams(args);
+    if (args.type) p.type = args.type;
+    return ok(await fetchAll("/stocklocations", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_stock_location", "Detalle de una ubicación de stock.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/stocklocations/${id}`))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONTACTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_contacts",
+  "Contactos/clientes. type: private|company",
+  {
+    name:      z.string().optional(),
+    country:   z.string().optional().describe("Código de país (ar, us, gb, etc.)"),
+    type:      z.string().optional().describe("private | company"),
+    city:      z.string().optional(),
+    sort:      z.string().optional().default("+name"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    if (args.name)    p.name    = args.name;
+    if (args.country) p.country = args.country;
+    if (args.type)    p.type    = args.type;
+    if (args.city)    p.city    = args.city;
+    return ok(await fetchAll("/contacts", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_contact", "Detalle de un contacto.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/contacts/${id}`))
+);
+
+mcp.tool("get_contact_persons_of_contact", "Personas de contacto de un contacto.",
+  { contact_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ contact_id, fields, max_pages }) => ok(await fetchAll(`/contacts/${contact_id}/contactpersons`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_contact_files", "Archivos de un contacto.",
+  { contact_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ contact_id, max_pages }) => ok(await fetchAll(`/contacts/${contact_id}/files`, {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONTACT PERSONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_contact_persons", "Personas de contacto globalmente.",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(10) },
+  async (args) => ok(await fetchAll("/contactpersons", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_contact_person", "Detalle de una persona de contacto.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/contactpersons/${id}`))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CREW
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_crew", "Lista de personal/crew.",
+  { sort: z.string().optional().default("+displayname"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/crew", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_crew_member", "Detalle de un miembro del crew.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/crew/${id}`))
+);
+
+mcp.tool("get_crew_appointments", "Citas de un miembro del crew.",
+  { crew_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ crew_id, fields, max_pages }) => ok(await fetchAll(`/crew/${crew_id}/appointments`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_crew_availability", "Disponibilidad de un miembro del crew.",
+  {
+    crew_id: z.number(),
+    start_gte: z.string().optional(),
+    start_lte: z.string().optional(),
+    fields:    z.string().optional(),
+    max_pages: z.number().optional().default(5),
+  },
+  async ({ crew_id, start_gte, start_lte, fields, max_pages }) => {
+    const p = {};
+    dateRange(p, "start", start_gte, start_lte);
+    if (fields) p.fields = fields;
+    return ok(await fetchAll(`/crew/${crew_id}/crewavailability`, p, max_pages));
+  }
+);
+
+mcp.tool("get_crew_rates", "Tarifas de un miembro del crew.",
+  { crew_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ crew_id, fields, max_pages }) => ok(await fetchAll(`/crew/${crew_id}/crewrates`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_crew_invitations", "Invitaciones de un miembro del crew.",
+  { crew_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ crew_id, fields, max_pages }) => ok(await fetchAll(`/crew/${crew_id}/invitations`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_crew_files", "Archivos de un miembro del crew.",
+  { crew_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ crew_id, max_pages }) => ok(await fetchAll(`/crew/${crew_id}/files`, {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CREW AVAILABILITY (colección global)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_crewavailability",
+  "Disponibilidad global de crew. status: B (blocked) | N (not available) | O (available)",
+  {
+    start_gte: z.string().optional(),
+    start_lte: z.string().optional(),
+    end_gte:   z.string().optional(),
+    end_lte:   z.string().optional(),
+    status:    z.string().optional().describe("B | N | O"),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "start", args.start_gte, args.start_lte);
+    dateRange(p, "end",   args.end_gte,   args.end_lte);
+    if (args.status) p.status = args.status;
+    return ok(await fetchAll("/crewavailability", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_crewavailability_item", "Detalle de disponibilidad de crew.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/crewavailability/${id}`))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CREW RATES (colección global)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_crewrates", "Tarifas de crew globalmente. type: price|cost. subtype: global|flat|temp",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/crewrates", baseParams(args), args.max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// APPOINTMENTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_appointments",
+  "Citas/appointments con filtros de fecha.",
+  {
+    start_gte: z.string().optional(),
+    start_lte: z.string().optional(),
+    end_gte:   z.string().optional(),
+    end_lte:   z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "start", args.start_gte, args.start_lte);
+    dateRange(p, "end",   args.end_gte,   args.end_lte);
+    return ok(await fetchAll("/appointments", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_appointment", "Detalle de una cita.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/appointments/${id}`))
+);
+
+mcp.tool("get_appointment_crew", "Crew de una cita.",
+  { appointment_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ appointment_id, fields, max_pages }) => ok(await fetchAll(`/appointments/${appointment_id}/appointmentcrew`, fields ? { fields } : {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// APPOINTMENT CREW (colección global)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_appointmentcrew", "Crew asignado a citas globalmente.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/appointmentcrew", baseParams(args), args.max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INVITATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_invitations",
+  "Invitaciones de crew. type: availability|reservation|final_planning|draft_planning. emailstatus: pending|new|newremind|inprogress|processed",
+  {
+    type:        z.string().optional(),
+    emailstatus: z.string().optional(),
+    start_gte:   z.string().optional(),
+    start_lte:   z.string().optional(),
+    sort:        z.string().optional().default("-id"),
+    fields:      z.string().optional(),
+    limit:       z.number().optional().default(300),
+    max_pages:   z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    if (args.type)        p.type        = args.type;
+    if (args.emailstatus) p.emailstatus = args.emailstatus;
+    dateRange(p, "start", args.start_gte, args.start_lte);
+    return ok(await fetchAll("/invitations", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_invitation", "Detalle de una invitación.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/invitations/${id}`))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INVOICES
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_invoices",
+  "Facturas con filtros de fecha. invoicetype: C (credit) | F (factura)",
+  {
+    date_gte:     z.string().optional().describe("date >= (ISO 8601)"),
+    date_lte:     z.string().optional(),
+    invoicetype:  z.string().optional().describe("C | F"),
+    sort:         z.string().optional().default("-id"),
+    fields:       z.string().optional(),
+    limit:        z.number().optional().default(300),
+    max_pages:    z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "date", args.date_gte, args.date_lte);
+    if (args.invoicetype) p.invoicetype = args.invoicetype;
+    return ok(await fetchAll("/invoices", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_invoice", "Detalle de una factura.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/invoices/${id}`))
+);
+
+mcp.tool("get_invoice_lines_of_invoice", "Líneas de detalle de una factura.",
+  { invoice_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ invoice_id, fields, max_pages }) => ok(await fetchAll(`/invoices/${invoice_id}/invoicelines`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_invoice_payments", "Pagos de una factura.",
+  { invoice_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ invoice_id, fields, max_pages }) => ok(await fetchAll(`/invoices/${invoice_id}/payments`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_invoice_files", "Archivos de una factura.",
+  { invoice_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ invoice_id, max_pages }) => ok(await fetchAll(`/invoices/${invoice_id}/files`, {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INVOICE LINES (colección global)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_invoice_lines", "Líneas de factura globalmente.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(10) },
+  async (args) => ok(await fetchAll("/invoicelines", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_invoice_line", "Detalle de una línea de factura.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/invoicelines/${id}`))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PAYMENTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_payments",
+  "Pagos con filtros de fecha. payment_import_source: none|exactonline|quickbooks|xero|publicapi",
+  {
+    moment_gte: z.string().optional().describe("moment >= (ISO 8601)"),
+    moment_lte: z.string().optional(),
+    sort:       z.string().optional().default("-id"),
+    fields:     z.string().optional(),
+    limit:      z.number().optional().default(300),
+    max_pages:  z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "moment", args.moment_gte, args.moment_lte);
+    return ok(await fetchAll("/payments", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_payment", "Detalle de un pago.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/payments/${id}`))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONTRACTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_contracts", "Contratos.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(10) },
+  async (args) => ok(await fetchAll("/contracts", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_contract", "Detalle de un contrato.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/contracts/${id}`))
+);
+
+mcp.tool("get_contract_invoice_lines", "Líneas de factura de un contrato.",
+  { contract_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ contract_id, fields, max_pages }) => ok(await fetchAll(`/contracts/${contract_id}/invoicelines`, fields ? { fields } : {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// QUOTES
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_quotes", "Cotizaciones.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(10) },
+  async (args) => ok(await fetchAll("/quotes", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_quote", "Detalle de una cotización.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/quotes/${id}`))
+);
+
+mcp.tool("get_quote_invoice_lines", "Líneas de una cotización.",
+  { quote_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ quote_id, fields, max_pages }) => ok(await fetchAll(`/quotes/${quote_id}/invoicelines`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_quote_files", "Archivos de una cotización.",
+  { quote_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ quote_id, max_pages }) => ok(await fetchAll(`/quotes/${quote_id}/files`, {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COSTS (colección global)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_costs", "Costos adicionales globalmente.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(10) },
+  async (args) => ok(await fetchAll("/costs", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_cost", "Detalle de un costo adicional.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/costs/${id}`))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TIME REGISTRATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_time_registrations",
+  "Registros de tiempo trabajado. status: pending|approved|rejected",
+  {
+    start_gte: z.string().optional(),
+    start_lte: z.string().optional(),
+    end_gte:   z.string().optional(),
+    end_lte:   z.string().optional(),
+    status:    z.string().optional().describe("pending | approved | rejected"),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "start", args.start_gte, args.start_lte);
+    dateRange(p, "end",   args.end_gte,   args.end_lte);
+    if (args.status) p.status = args.status;
+    return ok(await fetchAll("/timeregistration", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_time_registration", "Detalle de un registro de tiempo.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/timeregistration/${id}`))
+);
+
+mcp.tool("get_time_registration_activities", "Actividades de un registro de tiempo.",
+  { timeregistration_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ timeregistration_id, max_pages }) => ok(await fetchAll(`/timeregistration/${timeregistration_id}/timeregistrationactivities`, {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TIME REGISTRATION ACTIVITIES (colección global)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_timeregistration_activities_all", "Actividades de registros de tiempo globalmente.",
+  {
+    from_gte: z.string().optional(),
+    from_lte: z.string().optional(),
+    sort:     z.string().optional().default("-id"),
+    fields:   z.string().optional(),
+    limit:    z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "from", args.from_gte, args.from_lte);
+    return ok(await fetchAll("/timeregistrationactivities", p, args.max_pages));
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LEAVE
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_leave_requests",
+  "Solicitudes de ausencia. approval_status: pending|approved|rejected|canceled",
+  {
+    approval_status: z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    if (args.approval_status) p.approval_status = args.approval_status;
+    return ok(await fetchAll("/leaverequest", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_leave_request", "Detalle de una solicitud de ausencia.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/leaverequest/${id}`))
+);
+
+mcp.tool("get_leave_mutations", "Mutaciones de ausencia globalmente.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(10) },
+  async (args) => ok(await fetchAll("/leavemutation", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_leave_types", "Tipos de ausencia disponibles.",
+  { fields: z.string().optional(), max_pages: z.number().optional().default(3) },
+  async ({ fields, max_pages }) => ok(await fetchAll("/leavetypes", fields ? { fields } : {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SUBRENTALS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_subrentals",
+  "Subrentas (alquiler de equipo externo). type: Pick up | Delivery at warehouse | Delivery at location",
+  {
+    planperiod_start_gte: z.string().optional(),
+    planperiod_start_lte: z.string().optional(),
+    planperiod_end_gte:   z.string().optional(),
+    planperiod_end_lte:   z.string().optional(),
+    sort:      z.string().optional().default("-id"),
+    fields:    z.string().optional(),
+    limit:     z.number().optional().default(300),
+    max_pages: z.number().optional().default(10),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "planperiod_start", args.planperiod_start_gte, args.planperiod_start_lte);
+    dateRange(p, "planperiod_end",   args.planperiod_end_gte,   args.planperiod_end_lte);
+    return ok(await fetchAll("/subrentals", p, args.max_pages));
+  }
+);
+
+mcp.tool("get_subrental", "Detalle de una subrenta.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/subrentals/${id}`))
+);
+
+mcp.tool("get_subrental_equipment", "Equipos de una subrenta.",
+  { subrental_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ subrental_id, fields, max_pages }) => ok(await fetchAll(`/subrentals/${subrental_id}/subrentalequipment`, fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_subrental_equipment_groups", "Grupos de equipos de una subrenta.",
+  { subrental_id: z.number(), fields: z.string().optional(), max_pages: z.number().optional().default(5) },
+  async ({ subrental_id, fields, max_pages }) => ok(await fetchAll(`/subrentals/${subrental_id}/subrentalequipmentgroup`, fields ? { fields } : {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SUBRENTAL EQUIPMENT (colecciones globales)
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_subrental_equipment_all", "Equipos de subrentas globalmente.",
+  {
+    planperiod_start_gte: z.string().optional(),
+    planperiod_start_lte: z.string().optional(),
+    sort: z.string().optional().default("-id"),
+    fields: z.string().optional(),
+    limit: z.number().optional().default(300),
+    max_pages: z.number().optional().default(5),
+  },
+  async (args) => {
+    const p = baseParams(args);
+    dateRange(p, "planperiod_start", args.planperiod_start_gte, args.planperiod_start_lte);
+    return ok(await fetchAll("/subrentalequipment", p, args.max_pages));
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VEHICLES
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_vehicles", "Vehículos disponibles.",
+  { sort: z.string().optional().default("+name"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/vehicles", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_vehicle", "Detalle de un vehículo.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/vehicles/${id}`))
+);
+
+mcp.tool("get_vehicle_files", "Archivos de un vehículo.",
+  { vehicle_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ vehicle_id, max_pages }) => ok(await fetchAll(`/vehicles/${vehicle_id}/files`, {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RATES & FACTORS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_rates", "Tarifas de crew.",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/rates", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_rate", "Detalle de una tarifa.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/rates/${id}`))
+);
+
+mcp.tool("get_rate_factors", "Factores de una tarifa.",
+  { rate_id: z.number(), max_pages: z.number().optional().default(5) },
+  async ({ rate_id, max_pages }) => ok(await fetchAll(`/rates/${rate_id}/ratefactors`, {}, max_pages))
+);
+
+mcp.tool("get_ratefactors", "Factores de tarifa globalmente.",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/ratefactors", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_factor_groups", "Grupos de factores.",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/factorgroups", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_factors", "Factores globalmente.",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/factors", baseParams(args), args.max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TAX CLASSES & LEDGER CODES
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_tax_classes", "Clases de impuestos. type: vat|tax|notax",
+  { fields: z.string().optional(), max_pages: z.number().optional().default(3) },
+  async ({ fields, max_pages }) => ok(await fetchAll("/taxclasses", fields ? { fields } : {}, max_pages))
+);
+
+mcp.tool("get_ledger_codes", "Códigos de libro mayor.",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/ledgercodes", baseParams(args), args.max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STATUSES
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_statuses", "Estados de proyectos disponibles.",
+  { fields: z.string().optional(), max_pages: z.number().optional().default(3) },
+  async ({ fields, max_pages }) => ok(await fetchAll("/statuses", fields ? { fields } : {}, max_pages))
+);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FILES & FOLDERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+mcp.tool("get_files", "Archivos globalmente.",
+  { sort: z.string().optional().default("-id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/files", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_file", "Detalle de un archivo.",
+  { id: z.number() },
+  async ({ id }) => ok(await fetchOne(`/files/${id}`))
+);
+
+mcp.tool("get_file_folders", "Carpetas de archivos.",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/file_folders", baseParams(args), args.max_pages))
+);
+
+mcp.tool("get_folders", "Carpetas de plantillas. itemtype: equipment|contact|vehicle|user|container|project template|default function",
+  { sort: z.string().optional().default("+id"), fields: z.string().optional(), limit: z.number().optional().default(300), max_pages: z.number().optional().default(5) },
+  async (args) => ok(await fetchAll("/folders", baseParams(args), args.max_pages))
+);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Express + SSE
+// ──────────────────────────────────────────────────────────────────────────────
+const app = express();
+const transports = {};
+
+app.get("/sse", async (req, res) => {
+  const transport = new SSEServerTransport("/messages", res);
+  transports[transport.sessionId] = transport;
+  res.on("close", () => delete transports[transport.sessionId]);
+  await mcp.connect(transport);
 });
+
+app.post("/messages", express.json(), async (req, res) => {
+  const sessionId = new URL(req.url, "http://localhost").searchParams.get("sessionId");
+  const transport = transports[sessionId];
+  if (!transport) return res.status(404).json({ error: "Session not found" });
+  await transport.handlePostMessage(req, res, req.body);
+});
+
+app.get("/health", (_, res) =>
+  res.json({ status: "ok", version: "3.0.0", tools: Object.keys(mcp._registeredTools || {}).length })
+);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Rentman MCP v3 running on port ${PORT}`));
